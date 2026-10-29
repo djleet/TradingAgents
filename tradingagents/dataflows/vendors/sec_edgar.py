@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 _TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 _FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+_ARCHIVES_BASE_URL = "https://www.sec.gov/Archives/edgar/data"
 
 # A filing history only changes when something new is filed, so one fetch per
 # company per day serves every date a run asks about.
@@ -255,3 +257,142 @@ def get_income_statement(ticker: str, freq: str = "quarterly", as_of_date: str |
 def get_cashflow(ticker: str, freq: str = "quarterly", as_of_date: str | None = None) -> str:
     """Cash flow statement as filed on or before ``as_of_date``."""
     return _statement("cashflow", ticker, freq, as_of_date, "Cash Flow Statement")
+
+
+def _submission_rows(payload: dict) -> list[dict]:
+    """Turn SEC's column-oriented submissions response into filing rows."""
+    recent = (payload.get("filings") or {}).get("recent") or payload
+    accessions = recent.get("accessionNumber") or []
+    rows: list[dict] = []
+    fields = (
+        "filingDate",
+        "reportDate",
+        "acceptanceDateTime",
+        "form",
+        "primaryDocument",
+        "primaryDocDescription",
+        "items",
+    )
+    for index, accession in enumerate(accessions):
+        row = {"accessionNumber": accession}
+        for field in fields:
+            values = recent.get(field) or []
+            row[field] = values[index] if index < len(values) else ""
+        rows.append(row)
+    return rows
+
+
+def _known_by(row: dict, as_of_date: str) -> bool:
+    """Whether the filing had actually been accepted by the knowledge date."""
+    accepted = row.get("acceptanceDateTime") or ""
+    knowledge_date = accepted[:10] if len(accepted) >= 10 else row.get("filingDate", "")
+    return bool(knowledge_date) and knowledge_date <= as_of_date
+
+
+def _submissions(
+    cik: str,
+    as_of_date: str,
+    requested_forms: set[str],
+    limit: int,
+) -> list[dict]:
+    """Read only as many SEC submission indexes as the query needs."""
+    payload = _cached_json(_SUBMISSIONS_URL.format(cik=cik), f"CIK{cik}-submissions.json")
+    rows = _submission_rows(payload)
+
+    def matching_count() -> int:
+        return sum(
+            _known_by(row, as_of_date)
+            and (not requested_forms or row.get("form", "").upper() in requested_forms)
+            for row in rows
+        )
+
+    # The main response normally has enough recent filings. Older index files
+    # are fetched newest-first only for historical runs or sparse form filters;
+    # eagerly downloading decades of indexes is both slow and unfriendly to SEC.
+    archives = sorted(
+        (payload.get("filings") or {}).get("files") or [],
+        key=lambda item: item.get("filingTo", ""),
+        reverse=True,
+    )
+    for archive in archives:
+        if matching_count() >= limit:
+            break
+        if archive.get("filingFrom", "") > as_of_date:
+            continue
+        name = archive.get("name")
+        if not name:
+            continue
+        archived = _cached_json(
+            f"https://data.sec.gov/submissions/{name}",
+            f"submissions-{name}",
+        )
+        rows.extend(_submission_rows(archived))
+    return rows
+
+
+def get_filings(
+    ticker: str,
+    as_of_date: str | None = None,
+    forms: str | None = None,
+    limit: int = 12,
+) -> str:
+    """Return SEC filing metadata known on or before ``as_of_date``.
+
+    This complements XBRL statements with event filings (8-K) and insider
+    ownership filings (Forms 3/4/5). It intentionally returns SEC acceptance
+    timestamps and primary-document links so the model can
+    distinguish when a filing became public instead of reasoning from a fiscal
+    period end.
+    """
+    as_of_date = as_of_date or datetime.now().strftime("%Y-%m-%d")
+    limit = max(1, min(int(limit), 50))
+    cik = cik_for(ticker)
+    if cik is None:
+        raise NoMarketDataError(ticker, ticker, "not a US SEC filer")
+
+    requested = {
+        item.strip().upper()
+        for item in (forms or "8-K,10-K,10-Q,3,4,5").split(",")
+        if item.strip()
+    }
+    rows = [
+        row
+        for row in _submissions(cik, as_of_date, requested, limit)
+        if _known_by(row, as_of_date)
+        and (not requested or row.get("form", "").upper() in requested)
+    ]
+    rows.sort(
+        key=lambda row: (row.get("acceptanceDateTime") or row.get("filingDate") or ""),
+        reverse=True,
+    )
+    rows = rows[:limit]
+    if not rows:
+        forms_label = ", ".join(sorted(requested)) or "any form"
+        raise NoMarketDataError(
+            ticker,
+            ticker,
+            f"no SEC filings ({forms_label}) filed by {as_of_date}",
+        )
+
+    cik_number = str(int(cik))
+    output = [
+        f"# SEC filings for {ticker.upper()} accepted on or before {as_of_date}",
+        "Acceptance time is the point-in-time knowledge boundary; links are official SEC documents.",
+        "",
+        "| Accepted | Form | Report date | Items / description | Primary document |",
+        "|---|---|---|---|---|",
+    ]
+    for row in rows:
+        accession = row["accessionNumber"]
+        accession_compact = accession.replace("-", "")
+        document = row.get("primaryDocument") or ""
+        url = f"{_ARCHIVES_BASE_URL}/{cik_number}/{accession_compact}/{document}" if document else ""
+        accepted = (row.get("acceptanceDateTime") or row.get("filingDate") or "").replace("T", " ")
+        details = row.get("items") or row.get("primaryDocDescription") or "—"
+        details = str(details).replace("|", "/").replace("\n", " ")
+        document_cell = f"[{document}]({url})" if url else "—"
+        output.append(
+            f"| {accepted} | {row.get('form') or '—'} | "
+            f"{row.get('reportDate') or '—'} | {details} | {document_cell} |"
+        )
+    return "\n".join(output)

@@ -321,3 +321,67 @@ def test_a_row_filed_only_year_to_date_keeps_its_figure_beside_a_row_filed_by_qu
     rows = {r.split(",")[0]: r.split(",")[1:] for r in out.splitlines()[3:]}
     assert rows["Operating Cash Flow"] == ["", "120"]
     assert rows["Capital Expenditure"] == ["10", ""]
+
+
+@pytest.mark.unit
+def test_filing_index_is_point_in_time_and_links_to_official_documents(monkeypatch):
+    submissions = {
+        "filings": {
+            "recent": {
+                "accessionNumber": ["0000320193-26-000010", "0000320193-26-000011"],
+                "filingDate": ["2026-01-15", "2026-01-30"],
+                "reportDate": ["2026-01-14", "2026-02-14"],
+                "acceptanceDateTime": ["2026-01-15T16:30:00.000Z", "2026-02-15T12:00:00.000Z"],
+                "form": ["8-K", "4"],
+                "primaryDocument": ["event.htm", "insider.xml"],
+                "primaryDocDescription": ["Current report", "Insider transaction"],
+                "items": ["2.02,9.01", ""],
+            },
+            "files": [],
+        }
+    }
+
+    def fetch(url):
+        if "company_tickers" in url:
+            return TICKER_MAP
+        if "submissions" in url:
+            return submissions
+        return FACTS
+
+    monkeypatch.setattr(sec_edgar, "_fetch_json", fetch)
+    output = sec_edgar.get_filings("AAPL", "2026-01-31", "8-K,4", 10)
+
+    assert "2026-01-15 16:30:00.000Z" in output
+    assert "2.02,9.01" in output
+    assert "event.htm" in output
+    assert "000032019326000010/event.htm" in output
+    # Its filingDate claims January, but it did not become public until
+    # February; acceptance time is the strict point-in-time boundary.
+    assert "insider.xml" not in output
+
+
+@pytest.mark.unit
+def test_filing_index_honors_form_filter(monkeypatch):
+    submissions = {
+        "filings": {
+            "recent": {
+                "accessionNumber": ["1", "2"],
+                "filingDate": ["2026-01-01", "2026-01-02"],
+                "reportDate": ["", ""],
+                "acceptanceDateTime": ["2026-01-01T12:00:00Z", "2026-01-02T12:00:00Z"],
+                "form": ["10-Q", "4"],
+                "primaryDocument": ["quarter.htm", "owner.xml"],
+                "primaryDocDescription": ["Quarterly report", "Ownership"],
+                "items": ["", ""],
+            },
+            "files": [],
+        }
+    }
+    monkeypatch.setattr(
+        sec_edgar,
+        "_fetch_json",
+        lambda url: TICKER_MAP if "company_tickers" in url else submissions,
+    )
+    output = sec_edgar.get_filings("AAPL", "2026-02-01", "4", 5)
+    assert "owner.xml" in output
+    assert "quarter.htm" not in output

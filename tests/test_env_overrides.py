@@ -13,6 +13,8 @@ def _config_with_env(monkeypatch, **overrides):
     """The defaults as the environment given here would set them."""
     for key in list(default_config_module._ENV_OVERRIDES):
         monkeypatch.delenv(key, raising=False)
+    for key in list(default_config_module._ENV_VENDOR_OVERRIDES):
+        monkeypatch.delenv(key, raising=False)
     for key, val in overrides.items():
         monkeypatch.setenv(key, val)
     return default_config_module.build_default_config()
@@ -137,3 +139,15 @@ def test_unknown_env_var_is_ignored(monkeypatch):
         TRADINGAGENTS_NONEXISTENT_KEY="oops",
     )
     assert "nonexistent_key" not in config
+
+
+def test_vendor_chain_and_warehouse_are_env_configurable(monkeypatch):
+    config = _config_with_env(
+        monkeypatch,
+        TRADINGAGENTS_CORE_STOCK_VENDORS="openbb,yfinance",
+        TRADINGAGENTS_WAREHOUSE_ENABLED="true",
+        TRADINGAGENTS_WAREHOUSE_PATH="/tmp/research.duckdb",
+    )
+    assert config["data_vendors"]["core_stock_apis"] == "openbb,yfinance"
+    assert config["data_warehouse_enabled"] is True
+    assert config["data_warehouse_path"] == "/tmp/research.duckdb"

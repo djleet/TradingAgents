@@ -138,6 +138,14 @@ Install the package and its dependencies (`uv pip install .` with uv):
 pip install .
 ```
 
+Optional research integrations are installed independently so the core remains
+lean: `pip install ".[warehouse]"` adds the DuckDB point-in-time archive,
+`pip install ".[portfolio]"` adds PyPortfolioOpt, `pip install ".[openbb]"`
+adds the OpenBB provider hub, and `pip install ".[enrichment]"` installs all
+three. Archived OHLCV can be exported to canonical Parquet/CSV plus Qlib and
+LEAN custom-data layouts with `python -m
+tradingagents.dataflows.research_export --output <new-directory>`.
+
 ### Docker
 
 Alternatively, run with Docker:

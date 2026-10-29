@@ -25,12 +25,24 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
     "TRADINGAGENTS_MAX_TOKENS":           "max_tokens",
+    "TRADINGAGENTS_WAREHOUSE_ENABLED":     "data_warehouse_enabled",
+    "TRADINGAGENTS_WAREHOUSE_PATH":        "data_warehouse_path",
     # Provider-specific reasoning/thinking knobs (None = each provider's own
     # default). Settable here for non-interactive runs; the CLI also offers an
     # interactive choice, which is skipped when the matching var is set.
     "TRADINGAGENTS_GOOGLE_THINKING_LEVEL":   "google_thinking_level",
     "TRADINGAGENTS_OPENAI_REASONING_EFFORT": "openai_reasoning_effort",
     "TRADINGAGENTS_ANTHROPIC_EFFORT":        "anthropic_effort",
+}
+
+_ENV_VENDOR_OVERRIDES = {
+    "TRADINGAGENTS_CORE_STOCK_VENDORS": "core_stock_apis",
+    "TRADINGAGENTS_TECHNICAL_VENDORS": "technical_indicators",
+    "TRADINGAGENTS_FUNDAMENTAL_VENDORS": "fundamental_data",
+    "TRADINGAGENTS_NEWS_VENDORS": "news_data",
+    "TRADINGAGENTS_MACRO_VENDORS": "macro_data",
+    "TRADINGAGENTS_PREDICTION_MARKET_VENDORS": "prediction_markets",
+    "TRADINGAGENTS_REGULATORY_VENDORS": "regulatory_data",
 }
 
 
@@ -71,6 +83,10 @@ def _apply_env_overrides(config: dict) -> dict:
             config[key] = _coerce(raw, config.get(key))
         except ValueError as exc:
             raise ValueError(f"Invalid value for {env_var}: {exc}") from exc
+    for env_var, category in _ENV_VENDOR_OVERRIDES.items():
+        raw = os.environ.get(env_var)
+        if raw is not None and raw.strip():
+            config["data_vendors"][category] = raw.strip()
     return config
 
 
@@ -84,6 +100,11 @@ def build_default_config() -> dict:
         "results_dir": os.getenv("TRADINGAGENTS_RESULTS_DIR") or os.path.join(_TRADINGAGENTS_HOME, "logs"),
         "data_cache_dir": os.getenv("TRADINGAGENTS_CACHE_DIR") or os.path.join(_TRADINGAGENTS_HOME, "cache"),
         "memory_log_path": os.getenv("TRADINGAGENTS_MEMORY_LOG_PATH") or os.path.join(_TRADINGAGENTS_HOME, "memory", "trading_memory.md"),
+        # Every successful vendor response is archived with its source, query
+        # window, as-of date and content hash. The optional DuckDB dependency is
+        # installed by the dashboard; core-only installs degrade to a no-op.
+        "data_warehouse_enabled": False,
+        "data_warehouse_path": None,
         # Optional cap on the number of resolved memory log entries. When set,
         # the oldest resolved entries are pruned once this limit is exceeded.
         # Pending entries are never pruned. None disables rotation entirely.
@@ -156,7 +177,7 @@ def build_default_config() -> dict:
         # routed to vendors you didn't choose. For ordered fallback, list several,
         # e.g. "yfinance,alpha_vantage". "default" uses all available vendors.
         "data_vendors": {
-            "core_stock_apis": "yfinance",       # Options: alpha_vantage, yfinance
+            "core_stock_apis": "yfinance",       # Options: alpha_vantage, openbb, yfinance
             "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance
             # Statements come from SEC EDGAR as filed (US filers), then Yahoo; the
         # overview and insider tools, which SEC EDGAR does not serve, from Yahoo.
@@ -164,6 +185,7 @@ def build_default_config() -> dict:
             "news_data": "yfinance",             # Options: alpha_vantage, yfinance
             "macro_data": "fred",                # Options: fred (needs FRED_API_KEY)
             "prediction_markets": "polymarket",  # Options: polymarket (keyless)
+            "regulatory_data": "sec_edgar",      # Options: sec_edgar (keyless)
         },
         # Tool-level configuration (takes precedence over category-level)
         "tool_vendors": {

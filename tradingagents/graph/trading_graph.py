@@ -12,6 +12,7 @@ from tradingagents.agents.context import build_instrument_context, resolve_instr
 from tradingagents.agents.rating import run_rating
 from tradingagents.dataflows.config import run_config, run_config_context, set_config
 from tradingagents.dataflows.date_window import get_current_date, is_historical
+from tradingagents.dataflows.evidence_router import build_evidence_bundle, render_evidence_context
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_tier_client, tier_provider
@@ -297,11 +298,37 @@ class TradingAgentsGraph:
         memory log's lessons are not here: the graph's Memory Log step settles
         and loads them alongside the analysts (see ``_memory_step``).
         """
+        instrument_context = self.resolve_instrument_context(company_name, asset_type, trade_date)
+        try:
+            evidence_bundle = build_evidence_bundle(
+                company_name,
+                str(trade_date),
+                self.config,
+                purpose="backtest" if is_historical(trade_date) else "analysis",
+            )
+            instrument_context = f"{instrument_context}\n\n{render_evidence_context(evidence_bundle)}"
+        except Exception as exc:  # archived evidence must never prevent the base analysis
+            logger.warning("Evidence Router failed open for %s on %s: %s", company_name, trade_date, exc)
+            evidence_bundle = {
+                "model_version": "evidence-router-v1",
+                "symbol": company_name,
+                "analysis_date": str(trade_date),
+                "purpose": "analysis",
+                "verdict": "insufficient",
+                "coverage_score": 0,
+                "eligible_count": 0,
+                "blocked_count": 0,
+                "missing": [],
+                "items": [],
+                "blocked": [],
+                "message": "Evidence Router was unavailable; the base analysis continued.",
+            }
         return self.propagator.create_initial_state(
             company_name,
             trade_date,
             asset_type=asset_type,
-            instrument_context=self.resolve_instrument_context(company_name, asset_type, trade_date),
+            instrument_context=instrument_context,
+            evidence_bundle=evidence_bundle,
             portfolio_context=portfolio.render(company_name) if portfolio is not None else "",
         )
 
@@ -461,6 +488,7 @@ class TradingAgentsGraph:
             "investment_plan": final_state["investment_plan"],
             "final_trade_decision": final_state["final_trade_decision"],
             "final_rating": run_rating(final_state),
+            "evidence_bundle": final_state.get("evidence_bundle", {}),
             "run_settings": self.run_settings(),
         }
 

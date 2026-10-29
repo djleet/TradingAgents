@@ -11,6 +11,7 @@ from langgraph.prebuilt import InjectedState
 
 from tradingagents.dataflows.date_window import as_of, as_of_window
 from tradingagents.dataflows.errors import NoMarketDataError, VendorUnavailableError
+from tradingagents.dataflows.quantitative import build_quantitative_report
 from tradingagents.dataflows.router import no_data_available, route_to_vendor, vendor_unavailable
 from tradingagents.dataflows.vendors.yahoo.snapshot import build_verified_market_snapshot
 
@@ -90,6 +91,27 @@ def get_verified_market_snapshot(
         return build_verified_market_snapshot(symbol, as_of(curr_date, trade_date), look_back_days)
     except VendorUnavailableError as exc:
         return vendor_unavailable("get_verified_market_snapshot", exc)
+    except NoMarketDataError as exc:
+        return no_data_available(exc)
+
+
+@tool
+def get_quantitative_signal(
+    symbol: Annotated[str, InjectedState("company_of_interest")],
+    lookback_calendar_days: Annotated[
+        int, "calendar-day lookback used by the deterministic model (120-2000)"
+    ] = 550,
+    trade_date: Annotated[str, InjectedState("trade_date")] = "",
+) -> str:
+    """Calculate a deterministic trend/risk cross-check from point-in-time OHLCV.
+
+    The model is independent of the LLM committee and reports its transparent
+    inputs, coverage and risk regime. It is not a return forecast.
+    """
+    try:
+        return build_quantitative_report(symbol, trade_date, lookback_calendar_days)
+    except VendorUnavailableError as exc:
+        return vendor_unavailable("get_quantitative_signal", exc)
     except NoMarketDataError as exc:
         return no_data_available(exc)
 
@@ -227,6 +249,25 @@ def get_insider_transactions(
         str: A report of insider transaction data
     """
     return route_to_vendor("get_insider_transactions", ticker, trade_date or None)
+
+
+@tool
+def get_sec_filings(
+    ticker: Annotated[str, InjectedState("company_of_interest")],
+    forms: Annotated[
+        str,
+        "Comma-separated SEC forms, for example '8-K,10-Q,3,4,5'",
+    ] = "8-K,10-K,10-Q,3,4,5",
+    limit: Annotated[int, "Maximum number of filings to return (1-50)"] = 12,
+    trade_date: Annotated[str, InjectedState("trade_date")] = "",
+) -> str:
+    """Retrieve point-in-time SEC filing metadata and official document links.
+
+    Use Form 8-K for material events, Forms 3/4/5 for insider ownership and
+    10-K/Q for reports. Results never include a filing accepted after the
+    analysis date.
+    """
+    return route_to_vendor("get_sec_filings", ticker, trade_date or None, forms, limit)
 
 
 @tool
