@@ -7,7 +7,7 @@ import json
 import re
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -23,8 +23,11 @@ from tradingagents.dataflows.warehouse import (
     warehouse_path,
 )
 
-SCHEDULER_VERSION = "enrichment-scheduler-v1"
+SCHEDULER_VERSION = "enrichment-scheduler-v2"
 _TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+_CIRCUIT_FAILURE_THRESHOLD = 3
+_CIRCUIT_BASE_COOLDOWN_SECONDS = 15 * 60
+_CIRCUIT_MAX_COOLDOWN_SECONDS = 6 * 60 * 60
 
 
 def _safe_json(value: Any) -> str:
@@ -120,13 +123,58 @@ def _ensure_schema(connection) -> None:
             title VARCHAR NOT NULL,
             message VARCHAR NOT NULL,
             created_at TIMESTAMPTZ NOT NULL,
-            acknowledged_at TIMESTAMPTZ
+            acknowledged_at TIMESTAMPTZ,
+            affected_symbols_json VARCHAR NOT NULL DEFAULT '[]',
+            occurrence_count INTEGER NOT NULL DEFAULT 1,
+            next_retry_at TIMESTAMPTZ
         )
         """
     )
     connection.execute(
+        "ALTER TABLE enrichment_scheduler_alerts ADD COLUMN IF NOT EXISTS "
+        "affected_symbols_json VARCHAR DEFAULT '[]'"
+    )
+    connection.execute(
+        "ALTER TABLE enrichment_scheduler_alerts ADD COLUMN IF NOT EXISTS "
+        "occurrence_count INTEGER DEFAULT 1"
+    )
+    connection.execute(
+        "ALTER TABLE enrichment_scheduler_alerts ADD COLUMN IF NOT EXISTS "
+        "next_retry_at TIMESTAMPTZ"
+    )
+    connection.execute(
         """CREATE INDEX IF NOT EXISTS idx_enrichment_alerts_status
            ON enrichment_scheduler_alerts(acknowledged_at, created_at)"""
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS enrichment_source_circuits (
+            dataset VARCHAR PRIMARY KEY,
+            provider VARCHAR NOT NULL,
+            state VARCHAR NOT NULL,
+            opened_at TIMESTAMPTZ,
+            retry_at TIMESTAMPTZ,
+            open_count INTEGER NOT NULL,
+            last_probe_at TIMESTAMPTZ,
+            updated_at TIMESTAMPTZ NOT NULL
+        )
+        """
+    )
+    bootstrap_time = datetime.now(UTC)
+    connection.execute(
+        """INSERT INTO enrichment_source_circuits
+           SELECT h.dataset, h.provider, 'open', ?, ?, 1, NULL, ?
+           FROM enrichment_source_health h
+           LEFT JOIN enrichment_source_circuits c USING (dataset)
+           WHERE c.dataset IS NULL
+             AND h.last_status = 'unavailable'
+             AND h.consecutive_failures >= ?""",
+        [
+            bootstrap_time,
+            bootstrap_time + timedelta(seconds=_CIRCUIT_BASE_COOLDOWN_SECONDS),
+            bootstrap_time,
+            _CIRCUIT_FAILURE_THRESHOLD,
+        ],
     )
 
 
@@ -334,6 +382,16 @@ def enrichment_schedule_is_due(
         return False
     if local_now.weekday() not in schedule.get("weekdays", []):
         return False
+    retry_at = (schedule.get("last_summary") or {}).get("next_retry_at")
+    if retry_at:
+        try:
+            retry_time = datetime.fromisoformat(str(retry_at).replace("Z", "+00:00"))
+            if retry_time.tzinfo is None:
+                retry_time = retry_time.replace(tzinfo=UTC)
+            if local_now.astimezone(UTC) >= retry_time.astimezone(UTC):
+                return True
+        except (TypeError, ValueError):
+            pass
     if (local_now.hour, local_now.minute) < (hour, minute):
         return False
     return schedule.get("last_run_date") != local_now.date().isoformat()
@@ -390,6 +448,86 @@ def _update_source_health(connection, source: dict[str, Any], checked_at: dateti
     return consecutive
 
 
+def _circuit_snapshot(connection, checked_at: datetime) -> dict[str, str | None]:
+    """Return open circuits and move expired ones to a single half-open probe."""
+    rows = connection.execute(
+        """SELECT dataset, state, retry_at FROM enrichment_source_circuits
+           WHERE state IN ('open', 'half_open')"""
+    ).fetchall()
+    disabled: dict[str, str | None] = {}
+    for dataset, state, retry_at in rows:
+        if state == "open" and retry_at and checked_at < retry_at.astimezone(UTC):
+            disabled[str(dataset)] = retry_at.astimezone(UTC).isoformat()
+            continue
+        if state == "open":
+            connection.execute(
+                """UPDATE enrichment_source_circuits
+                   SET state = 'half_open', last_probe_at = ?, updated_at = ?
+                   WHERE dataset = ?""",
+                [checked_at, checked_at, dataset],
+            )
+    return disabled
+
+
+def _update_source_circuit(
+    connection,
+    *,
+    dataset: str,
+    provider: str,
+    status: str,
+    consecutive_failures: int,
+    checked_at: datetime,
+) -> dict[str, Any]:
+    current = connection.execute(
+        """SELECT state, open_count, retry_at FROM enrichment_source_circuits
+           WHERE dataset = ?""",
+        [dataset],
+    ).fetchone()
+    state, open_count, previous_retry = current or ("closed", 0, None)
+    if status in {"available", "partial"}:
+        connection.execute(
+            """INSERT INTO enrichment_source_circuits VALUES (
+                   ?, ?, 'closed', NULL, NULL, ?, NULL, ?
+               ) ON CONFLICT (dataset) DO UPDATE SET
+                   provider = excluded.provider, state = 'closed', opened_at = NULL,
+                   retry_at = NULL, last_probe_at = NULL, updated_at = excluded.updated_at""",
+            [dataset, provider, int(open_count), checked_at],
+        )
+        return {"state": "closed", "retry_at": None, "open_count": int(open_count)}
+
+    should_open = (
+        consecutive_failures >= _CIRCUIT_FAILURE_THRESHOLD or state == "half_open"
+    )
+    if not should_open:
+        return {
+            "state": state,
+            "retry_at": previous_retry.astimezone(UTC).isoformat()
+            if previous_retry
+            else None,
+            "open_count": int(open_count),
+        }
+    next_open_count = int(open_count) + 1 if state != "open" else int(open_count)
+    cooldown = min(
+        _CIRCUIT_BASE_COOLDOWN_SECONDS * (2 ** max(next_open_count - 1, 0)),
+        _CIRCUIT_MAX_COOLDOWN_SECONDS,
+    )
+    retry_at = checked_at + timedelta(seconds=cooldown)
+    connection.execute(
+        """INSERT INTO enrichment_source_circuits VALUES (
+               ?, ?, 'open', ?, ?, ?, NULL, ?
+           ) ON CONFLICT (dataset) DO UPDATE SET
+               provider = excluded.provider, state = 'open',
+               opened_at = excluded.opened_at, retry_at = excluded.retry_at,
+               open_count = excluded.open_count, updated_at = excluded.updated_at""",
+        [dataset, provider, checked_at, retry_at, next_open_count, checked_at],
+    )
+    return {
+        "state": "open",
+        "retry_at": retry_at.isoformat(),
+        "open_count": next_open_count,
+    }
+
+
 def _create_alert(
     connection,
     *,
@@ -402,16 +540,46 @@ def _create_alert(
     message: str,
     symbol: str | None = None,
     dataset: str | None = None,
+    affected_symbols: list[str] | None = None,
+    occurrence_count: int = 1,
+    next_retry_at: str | None = None,
 ) -> dict[str, Any]:
     identity = f"{schedule_id}|{as_of_date}|{alert_type}|{symbol or ''}|{dataset or ''}"
     alert_id = hashlib.sha256(identity.encode()).hexdigest()
     created_at = datetime.now(UTC)
+    symbols = list(dict.fromkeys(affected_symbols or ([symbol] if symbol else [])))
+    retry_at = (
+        datetime.fromisoformat(next_retry_at.replace("Z", "+00:00"))
+        if next_retry_at
+        else None
+    )
     connection.execute(
-        """INSERT OR IGNORE INTO enrichment_scheduler_alerts
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+        """INSERT INTO enrichment_scheduler_alerts (
+               alert_id, schedule_id, run_id, symbol, dataset, alert_type,
+               severity, title, message, created_at, acknowledged_at,
+               affected_symbols_json, occurrence_count, next_retry_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+           ON CONFLICT (alert_id) DO UPDATE SET
+               run_id = excluded.run_id, severity = excluded.severity,
+               title = excluded.title, message = excluded.message,
+               created_at = excluded.created_at, acknowledged_at = NULL,
+               affected_symbols_json = excluded.affected_symbols_json,
+               occurrence_count = excluded.occurrence_count,
+               next_retry_at = excluded.next_retry_at""",
         [
-            alert_id, schedule_id, run_id, symbol, dataset, alert_type, severity,
-            title[:200], message[:1000], created_at,
+            alert_id,
+            schedule_id,
+            run_id,
+            symbol,
+            dataset,
+            alert_type,
+            severity,
+            title[:200],
+            message[:1000],
+            created_at,
+            _safe_json(symbols),
+            max(1, int(occurrence_count)),
+            retry_at,
         ],
     )
     return {
@@ -426,7 +594,31 @@ def _create_alert(
         "message": message,
         "created_at": created_at.isoformat(),
         "acknowledged_at": None,
+        "affected_symbols": symbols,
+        "affected_symbol_count": len(symbols),
+        "occurrence_count": max(1, int(occurrence_count)),
+        "next_retry_at": retry_at.isoformat() if retry_at else None,
     }
+
+
+def _resolve_alert_group(
+    connection,
+    *,
+    schedule_id: str,
+    alert_type: str,
+    dataset: str | None = None,
+    resolved_at: datetime | None = None,
+) -> None:
+    dataset_clause = "AND dataset = ?" if dataset else "AND dataset IS NULL"
+    parameters: list[Any] = [resolved_at or datetime.now(UTC), schedule_id, alert_type]
+    if dataset:
+        parameters.append(dataset)
+    connection.execute(
+        f"""UPDATE enrichment_scheduler_alerts SET acknowledged_at = ?
+            WHERE acknowledged_at IS NULL AND schedule_id = ? AND alert_type = ?
+            {dataset_clause}""",
+        parameters,
+    )
 
 
 def _stale_alerts(
@@ -436,7 +628,8 @@ def _stale_alerts(
     as_of_date: str,
     now: datetime,
 ) -> list[dict[str, Any]]:
-    alerts = []
+    stale_symbols: list[str] = []
+    max_age_hours = 0.0
     threshold = float(schedule["stale_after_hours"])
     for symbol in schedule["symbols"]:
         try:
@@ -454,21 +647,34 @@ def _stale_alerts(
                 observed = observed.replace(tzinfo=UTC)
             age_hours = max(0.0, (now - observed.astimezone(UTC)).total_seconds() / 3600)
         if age_hours is None or age_hours > threshold:
-            age_label = "no saved snapshot" if age_hours is None else f"{age_hours:.0f} hours old"
-            alerts.append(
-                _create_alert(
-                    connection,
-                    schedule_id=schedule["schedule_id"],
-                    run_id=run_id,
-                    as_of_date=as_of_date,
-                    alert_type="stale_symbol",
-                    severity="high" if age_hours is None or age_hours > threshold * 2 else "medium",
-                    title=f"{symbol} enrichment is stale",
-                    message=f"Latest enrichment is {age_label}; freshness target is {int(threshold)} hours.",
-                    symbol=symbol,
-                )
-            )
-    return alerts
+            stale_symbols.append(symbol)
+            max_age_hours = max(max_age_hours, age_hours or threshold * 2 + 1)
+    _resolve_alert_group(
+        connection,
+        schedule_id=schedule["schedule_id"],
+        alert_type="stale_symbol",
+        resolved_at=now,
+    )
+    if not stale_symbols:
+        return []
+    severity = "high" if max_age_hours > threshold * 2 else "medium"
+    return [
+        _create_alert(
+            connection,
+            schedule_id=schedule["schedule_id"],
+            run_id=run_id,
+            as_of_date=as_of_date,
+            alert_type="stale_symbol",
+            severity=severity,
+            title=f"{len(stale_symbols)} enrichment snapshots are stale",
+            message=(
+                f"{len(stale_symbols)} symbols exceed the {int(threshold)} hour freshness "
+                "target; review or run the controlled schedule."
+            ),
+            affected_symbols=stale_symbols,
+            occurrence_count=len(stale_symbols),
+        )
+    ]
 
 
 def execute_enrichment_schedule(
@@ -503,6 +709,10 @@ def execute_enrichment_schedule(
 
     results: list[dict[str, Any]] = []
     alerts: list[dict[str, Any]] = []
+    failed_symbols: list[str] = []
+    low_coverage_symbols: list[str] = []
+    source_issue_groups: dict[str, dict[str, Any]] = {}
+    healthy_datasets: set[str] = set()
     source_successes = 0
     source_failures = 0
     for index, symbol in enumerate(batch):
@@ -512,8 +722,17 @@ def execute_enrichment_schedule(
         while attempts < int(schedule["max_attempts"]):
             attempts += 1
             try:
-                snapshot = collector(symbol, as_of_date, config)
-                snapshot["registry"] = capture(snapshot, config)
+                connection = _connect(config)
+                try:
+                    disabled_datasets = _circuit_snapshot(
+                        connection, datetime.now(UTC)
+                    )
+                finally:
+                    connection.close()
+                collector_config = dict(config or {})
+                collector_config["enrichment_disabled_datasets"] = disabled_datasets
+                snapshot = collector(symbol, as_of_date, collector_config)
+                snapshot["registry"] = capture(snapshot, collector_config)
                 break
             except Exception as exc:  # bounded retry preserves the rest of the batch
                 error_type = type(exc).__name__
@@ -523,63 +742,67 @@ def execute_enrichment_schedule(
         try:
             checked_at = datetime.now(UTC)
             if snapshot is None:
-                alerts.append(
-                    _create_alert(
-                        connection,
-                        schedule_id=schedule["schedule_id"],
-                        run_id=run_id,
-                        as_of_date=as_of_date,
-                        alert_type="refresh_failed",
-                        severity="high",
-                        title=f"{symbol} enrichment refresh failed",
-                        message=f"All {attempts} bounded attempts failed ({error_type or 'provider error'}).",
-                        symbol=symbol,
-                    )
-                )
+                failed_symbols.append(symbol)
                 results.append(
                     {"symbol": symbol, "status": "failed", "attempts": attempts, "error_type": error_type}
                 )
             else:
                 unavailable = []
                 for source in snapshot.get("sources", []):
+                    dataset = str(source.get("dataset") or "unknown")
+                    provider = str(source.get("provider") or "Unknown")
+                    if source.get("circuit_open"):
+                        group = source_issue_groups.setdefault(
+                            dataset,
+                            {
+                                "provider": provider,
+                                "symbols": [],
+                                "max_consecutive": 0,
+                                "circuit_state": "open",
+                                "retry_at": source.get("retry_at"),
+                                "skipped_count": 0,
+                            },
+                        )
+                        group["symbols"].append(symbol)
+                        group["skipped_count"] += 1
+                        unavailable.append(dataset)
+                        continue
                     consecutive = _update_source_health(connection, source, checked_at)
+                    circuit = _update_source_circuit(
+                        connection,
+                        dataset=dataset,
+                        provider=provider,
+                        status=str(source.get("status") or "unavailable"),
+                        consecutive_failures=consecutive,
+                        checked_at=checked_at,
+                    )
                     if source.get("status") == "unavailable":
                         source_failures += 1
-                        unavailable.append(source.get("dataset"))
-                        alerts.append(
-                            _create_alert(
-                                connection,
-                                schedule_id=schedule["schedule_id"],
-                                run_id=run_id,
-                                as_of_date=as_of_date,
-                                alert_type="source_unavailable",
-                                severity="high" if consecutive >= 2 else "medium",
-                                title=f"{source.get('dataset', 'Source').replace('_', ' ').title()} unavailable",
-                                message=(
-                                    f"{symbol} returned no usable data from {source.get('provider', 'the provider')}. "
-                                    f"Consecutive source failures: {consecutive}."
-                                ),
-                                symbol=symbol,
-                                dataset=source.get("dataset"),
-                            )
+                        unavailable.append(dataset)
+                        group = source_issue_groups.setdefault(
+                            dataset,
+                            {
+                                "provider": provider,
+                                "symbols": [],
+                                "max_consecutive": 0,
+                                "circuit_state": circuit["state"],
+                                "retry_at": circuit.get("retry_at"),
+                                "skipped_count": 0,
+                            },
                         )
+                        group["symbols"].append(symbol)
+                        group["max_consecutive"] = max(
+                            int(group["max_consecutive"]), consecutive
+                        )
+                        if circuit["state"] == "open":
+                            group["circuit_state"] = "open"
+                            group["retry_at"] = circuit.get("retry_at")
                     else:
                         source_successes += 1
+                        healthy_datasets.add(dataset)
                 coverage = float((snapshot.get("coverage") or {}).get("score") or 0)
                 if coverage < 58:
-                    alerts.append(
-                        _create_alert(
-                            connection,
-                            schedule_id=schedule["schedule_id"],
-                            run_id=run_id,
-                            as_of_date=as_of_date,
-                            alert_type="low_coverage",
-                            severity="medium",
-                            title=f"{symbol} enrichment coverage is limited",
-                            message=f"Coverage is {coverage:.0f}/100; review missing sources before qualification.",
-                            symbol=symbol,
-                        )
-                    )
+                    low_coverage_symbols.append(symbol)
                 results.append(
                     {
                         "symbol": symbol,
@@ -602,9 +825,114 @@ def execute_enrichment_schedule(
     finished = datetime.now(UTC)
     connection = _connect(config)
     try:
+        _resolve_alert_group(
+            connection,
+            schedule_id=schedule["schedule_id"],
+            alert_type="refresh_failed",
+            resolved_at=finished,
+        )
+        if failed_symbols:
+            alerts.append(
+                _create_alert(
+                    connection,
+                    schedule_id=schedule["schedule_id"],
+                    run_id=run_id,
+                    as_of_date=as_of_date,
+                    alert_type="refresh_failed",
+                    severity="high",
+                    title=f"{len(failed_symbols)} enrichment refreshes failed",
+                    message="All bounded attempts failed for the affected symbols.",
+                    affected_symbols=failed_symbols,
+                    occurrence_count=len(failed_symbols),
+                )
+            )
+        for dataset in healthy_datasets - set(source_issue_groups):
+            _resolve_alert_group(
+                connection,
+                schedule_id=schedule["schedule_id"],
+                alert_type="source_unavailable",
+                dataset=dataset,
+                resolved_at=finished,
+            )
+        for dataset, group in source_issue_groups.items():
+            _resolve_alert_group(
+                connection,
+                schedule_id=schedule["schedule_id"],
+                alert_type="source_unavailable",
+                dataset=dataset,
+                resolved_at=finished,
+            )
+            affected = list(dict.fromkeys(group["symbols"]))
+            circuit_open = group["circuit_state"] == "open"
+            label = dataset.replace("_", " ").title()
+            retry_note = (
+                f" Automatic probe scheduled for {group['retry_at']}."
+                if group.get("retry_at")
+                else ""
+            )
+            alerts.append(
+                _create_alert(
+                    connection,
+                    schedule_id=schedule["schedule_id"],
+                    run_id=run_id,
+                    as_of_date=as_of_date,
+                    alert_type="source_unavailable",
+                    severity=(
+                        "high"
+                        if circuit_open or int(group["max_consecutive"]) >= 2
+                        else "medium"
+                    ),
+                    title=(
+                        f"{label} paused after repeated failures"
+                        if circuit_open
+                        else f"{label} unavailable for {len(affected)} symbol"
+                        f"{'s' if len(affected) != 1 else ''}"
+                    ),
+                    message=(
+                        f"{len(affected)} symbols were affected by {group['provider']}; "
+                        f"{int(group['skipped_count'])} redundant calls were skipped."
+                        f"{retry_note}"
+                    ),
+                    dataset=dataset,
+                    affected_symbols=affected,
+                    occurrence_count=len(affected),
+                    next_retry_at=group.get("retry_at"),
+                )
+            )
+        _resolve_alert_group(
+            connection,
+            schedule_id=schedule["schedule_id"],
+            alert_type="low_coverage",
+            resolved_at=finished,
+        )
+        if low_coverage_symbols:
+            affected = list(dict.fromkeys(low_coverage_symbols))
+            alerts.append(
+                _create_alert(
+                    connection,
+                    schedule_id=schedule["schedule_id"],
+                    run_id=run_id,
+                    as_of_date=as_of_date,
+                    alert_type="low_coverage",
+                    severity="medium",
+                    title=f"{len(affected)} enrichment snapshots have limited coverage",
+                    message="Review missing sources before qualification.",
+                    affected_symbols=affected,
+                    occurrence_count=len(affected),
+                )
+            )
         alerts.extend(_stale_alerts(connection, schedule, run_id, as_of_date, finished))
         if status == "completed" and alerts:
             status = "completed_with_warnings"
+        open_circuits = connection.execute(
+            """SELECT dataset, retry_at FROM enrichment_source_circuits
+               WHERE state = 'open' ORDER BY retry_at"""
+        ).fetchall()
+        next_retry_at = (
+            min(row[1].astimezone(UTC) for row in open_circuits if row[1]).isoformat()
+            if any(row[1] for row in open_circuits)
+            else None
+        )
         summary = {
             "model_version": SCHEDULER_VERSION,
             "run_id": run_id,
@@ -617,6 +945,11 @@ def execute_enrichment_schedule(
             "failed_count": failed,
             "source_success_count": source_successes,
             "source_failure_count": source_failures,
+            "source_circuit_skip_count": sum(
+                int(group["skipped_count"]) for group in source_issue_groups.values()
+            ),
+            "open_circuit_count": len(open_circuits),
+            "next_retry_at": next_retry_at,
             "alert_count": len({item["alert_id"] for item in alerts}),
             "next_cursor": next_cursor,
             "results": results,
@@ -685,7 +1018,10 @@ def list_enrichment_source_health(config: dict[str, Any] | None = None) -> list[
         return []
     try:
         rows = connection.execute(
-            "SELECT * FROM enrichment_source_health ORDER BY dataset"
+            """SELECT h.*, c.state, c.retry_at, c.open_count
+               FROM enrichment_source_health h
+               LEFT JOIN enrichment_source_circuits c USING (dataset)
+               ORDER BY h.dataset"""
         ).fetchall()
     finally:
         connection.close()
@@ -698,9 +1034,101 @@ def list_enrichment_source_health(config: dict[str, Any] | None = None) -> list[
             "last_success_at": row[10].astimezone(UTC).isoformat() if row[10] else None,
             "last_error": row[11],
             "availability_rate": round(100 * (row[3] + row[4]) / row[2], 1) if row[2] else 0,
+            "circuit_state": row[12] or "closed",
+            "retry_at": row[13].astimezone(UTC).isoformat() if row[13] else None,
+            "circuit_open_count": int(row[14] or 0),
         }
         for row in rows
     ]
+
+
+def _group_alert_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for item in items:
+        key = (
+            str(item["schedule_id"]),
+            str(item["alert_type"]),
+            str(item.get("dataset") or "")
+            if item["alert_type"] == "source_unavailable"
+            else "",
+        )
+        grouped.setdefault(key, []).append(item)
+    result = []
+    for key, members in grouped.items():
+        members.sort(key=lambda item: item["created_at"], reverse=True)
+        latest = dict(members[0])
+        symbols = list(
+            dict.fromkeys(
+                symbol
+                for item in members
+                for symbol in (
+                    item.get("affected_symbols")
+                    or ([item["symbol"]] if item.get("symbol") else [])
+                )
+            )
+        )
+        occurrences = sum(int(item.get("occurrence_count") or 1) for item in members)
+        latest["alert_id"] = hashlib.sha256(
+            f"enrichment-alert-group|{'|'.join(key)}".encode()
+        ).hexdigest()
+        latest["member_alert_ids"] = [item["alert_id"] for item in members]
+        latest["grouped_alert_count"] = len(members)
+        latest["occurrence_count"] = occurrences
+        latest["affected_symbols"] = symbols
+        latest["affected_symbol_count"] = len(symbols)
+        if len(symbols) != 1:
+            latest["symbol"] = None
+        latest["next_retry_at"] = min(
+            (
+                item["next_retry_at"]
+                for item in members
+                if item.get("next_retry_at")
+            ),
+            default=None,
+        )
+        if latest["alert_type"] == "source_unavailable" and symbols:
+            count = len(symbols)
+            label = str(latest.get("dataset") or "Source").replace("_", " ").title()
+            latest["title"] = (
+                f"{label} unavailable across {count} symbols"
+                if count != 1
+                else f"{label} unavailable for 1 symbol"
+            )
+            latest["message"] = (
+                f"{count} symbol{'s are' if count != 1 else ' is'} affected; "
+                f"{occurrences} source event{'s were' if occurrences != 1 else ' was'} "
+                "consolidated into this alert."
+            )
+        elif latest["alert_type"] == "stale_symbol" and symbols:
+            count = len(symbols)
+            latest["title"] = (
+                f"{count} enrichment snapshot{'s are' if count != 1 else ' is'} stale"
+            )
+            latest["message"] = (
+                f"{count} symbol{'s exceed' if count != 1 else ' exceeds'} the configured "
+                f"freshness target; {occurrences} event{'s were' if occurrences != 1 else ' was'} "
+                "consolidated."
+            )
+        elif latest["alert_type"] == "low_coverage" and symbols:
+            count = len(symbols)
+            latest["title"] = (
+                f"{count} snapshot{'s' if count != 1 else ''} "
+                f"{'have' if count != 1 else 'has'} limited coverage"
+            )
+            latest["message"] = (
+                f"{count} symbol{'s' if count != 1 else ''} "
+                f"{'need' if count != 1 else 'needs'} evidence review before qualification."
+            )
+        elif latest["alert_type"] == "refresh_failed" and symbols:
+            count = len(symbols)
+            latest["title"] = (
+                f"{count} enrichment refresh{'es' if count != 1 else ''} failed"
+            )
+            latest["message"] = (
+                f"All bounded attempts failed for {count} symbol{'s' if count != 1 else ''}."
+            )
+        result.append(latest)
+    return sorted(result, key=lambda item: item["created_at"], reverse=True)
 
 
 def list_enrichment_alerts(
@@ -712,22 +1140,30 @@ def list_enrichment_alerts(
     where = "WHERE acknowledged_at IS NULL" if unacknowledged_only else ""
     try:
         rows = connection.execute(
-            f"""SELECT * FROM enrichment_scheduler_alerts {where}
+            f"""SELECT alert_id, schedule_id, run_id, symbol, dataset, alert_type,
+                       severity, title, message, created_at, acknowledged_at,
+                       coalesce(affected_symbols_json, '[]'),
+                       coalesce(occurrence_count, 1), next_retry_at
+                FROM enrichment_scheduler_alerts {where}
                 ORDER BY created_at DESC LIMIT ?""",
-            [max(1, min(int(limit), 500))],
+            [500],
         ).fetchall()
     finally:
         connection.close()
-    return [
+    raw = [
         {
             "alert_id": row[0], "schedule_id": row[1], "run_id": row[2],
             "symbol": row[3], "dataset": row[4], "alert_type": row[5],
             "severity": row[6], "title": row[7], "message": row[8],
             "created_at": row[9].astimezone(UTC).isoformat(),
             "acknowledged_at": row[10].astimezone(UTC).isoformat() if row[10] else None,
+            "affected_symbols": json.loads(row[11]) if row[11] else [],
+            "occurrence_count": int(row[12] or 1),
+            "next_retry_at": row[13].astimezone(UTC).isoformat() if row[13] else None,
         }
         for row in rows
     ]
+    return _group_alert_items(raw)[: max(1, min(int(limit), 500))]
 
 
 def acknowledge_enrichment_alert(
@@ -742,7 +1178,50 @@ def acknowledge_enrichment_alert(
                WHERE alert_id = ? AND acknowledged_at IS NULL RETURNING alert_id""",
             [datetime.now(UTC), alert_id],
         ).fetchone()
-        return row is not None
+        if row is not None:
+            return True
+        rows = connection.execute(
+            """SELECT alert_id, schedule_id, run_id, symbol, dataset, alert_type,
+                      severity, title, message, created_at, acknowledged_at,
+                      coalesce(affected_symbols_json, '[]'),
+                      coalesce(occurrence_count, 1), next_retry_at
+               FROM enrichment_scheduler_alerts WHERE acknowledged_at IS NULL"""
+        ).fetchall()
+        raw = [
+            {
+                "alert_id": item[0],
+                "schedule_id": item[1],
+                "run_id": item[2],
+                "symbol": item[3],
+                "dataset": item[4],
+                "alert_type": item[5],
+                "severity": item[6],
+                "title": item[7],
+                "message": item[8],
+                "created_at": item[9].astimezone(UTC).isoformat(),
+                "acknowledged_at": None,
+                "affected_symbols": json.loads(item[11]) if item[11] else [],
+                "occurrence_count": int(item[12] or 1),
+                "next_retry_at": item[13].astimezone(UTC).isoformat()
+                if item[13]
+                else None,
+            }
+            for item in rows
+        ]
+        group = next(
+            (item for item in _group_alert_items(raw) if item["alert_id"] == alert_id),
+            None,
+        )
+        if not group:
+            return False
+        member_ids = group["member_alert_ids"]
+        placeholders = ", ".join("?" for _ in member_ids)
+        connection.execute(
+            f"""UPDATE enrichment_scheduler_alerts SET acknowledged_at = ?
+                WHERE alert_id IN ({placeholders}) AND acknowledged_at IS NULL""",
+            [datetime.now(UTC), *member_ids],
+        )
+        return True
     finally:
         connection.close()
 
@@ -751,6 +1230,7 @@ def get_enrichment_operations_status(config: dict[str, Any] | None = None) -> di
     schedules = list_enrichment_schedules(config)
     health = list_enrichment_source_health(config)
     alerts = list_enrichment_alerts(config, unacknowledged_only=True)
+    next_retries = [item["retry_at"] for item in health if item.get("retry_at")]
     return {
         "schedules": schedules,
         "schedule_count": len(schedules),
@@ -758,8 +1238,24 @@ def get_enrichment_operations_status(config: dict[str, Any] | None = None) -> di
         "source_health": health,
         "healthy_source_count": sum(item["last_status"] != "unavailable" for item in health),
         "degraded_source_count": sum(item["last_status"] == "unavailable" for item in health),
+        "open_circuit_count": sum(item["circuit_state"] == "open" for item in health),
+        "next_retry_at": min(next_retries) if next_retries else None,
         "alerts": alerts,
         "unacknowledged_alert_count": len(alerts),
-        "stale_symbol_count": len({item["symbol"] for item in alerts if item["alert_type"] == "stale_symbol"}),
+        "affected_symbol_count": len(
+            {
+                symbol
+                for item in alerts
+                for symbol in item.get("affected_symbols", [])
+            }
+        ),
+        "stale_symbol_count": len(
+            {
+                symbol
+                for item in alerts
+                if item["alert_type"] == "stale_symbol"
+                for symbol in item.get("affected_symbols", [])
+            }
+        ),
         "recent_runs": list_enrichment_runs(config, limit=10),
     }

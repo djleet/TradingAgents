@@ -472,14 +472,43 @@ _COLLECTORS: dict[str, Callable[[str, str], dict[str, Any]]] = {
 }
 
 
-def collect_enrichment_sources(symbol: str, as_of_date: str) -> dict[str, dict[str, Any]]:
+def collect_enrichment_sources(
+    symbol: str,
+    as_of_date: str,
+    *,
+    disabled_datasets: dict[str, str | None] | None = None,
+) -> dict[str, dict[str, Any]]:
     """Collect independent sources concurrently and preserve partial results."""
     canonical = normalize_symbol(symbol)
     results: dict[str, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=len(_COLLECTORS)) as executor:
+    disabled = disabled_datasets or {}
+    for name, retry_at in disabled.items():
+        if name not in _COLLECTORS:
+            continue
+        provider = "SEC EDGAR" if name == "sec_insider_filings" else "Yahoo Finance"
+        if name == "macro_calendar":
+            provider = "FRED/ALFRED"
+        results[name] = _dataset(
+            name,
+            provider,
+            "official" if name in {"macro_calendar", "sec_insider_filings"} else "aggregator",
+            status="unavailable",
+            completeness=0,
+            point_in_time=name in {"macro_calendar", "sec_insider_filings"},
+            caveat="Collection is temporarily paused by the source circuit breaker.",
+            error="Source circuit is open; an automatic probe is scheduled.",
+        )
+        results[name]["circuit_open"] = True
+        results[name]["retry_at"] = retry_at
+    enabled_collectors = {
+        name: collector for name, collector in _COLLECTORS.items() if name not in disabled
+    }
+    if not enabled_collectors:
+        return results
+    with ThreadPoolExecutor(max_workers=len(enabled_collectors)) as executor:
         futures = {
             executor.submit(collector, canonical, as_of_date): name
-            for name, collector in _COLLECTORS.items()
+            for name, collector in enabled_collectors.items()
         }
         for future in as_completed(futures):
             name = futures[future]
@@ -608,11 +637,17 @@ def build_enrichment_snapshot(
     source_payloads: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build one explainable enrichment snapshot without an LLM call."""
-    del config  # reserved for provider configuration and kept for API symmetry
     canonical = normalize_symbol(symbol)
     date.fromisoformat(as_of_date)
     observed_at = datetime.now(UTC).isoformat()
-    supplied = source_payloads if source_payloads is not None else collect_enrichment_sources(canonical, as_of_date)
+    disabled = (config or {}).get("enrichment_disabled_datasets") or {}
+    supplied = (
+        source_payloads
+        if source_payloads is not None
+        else collect_enrichment_sources(
+            canonical, as_of_date, disabled_datasets=disabled
+        )
+    )
     datasets = {
         name: supplied.get(name)
         or _dataset(

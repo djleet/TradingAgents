@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -132,9 +132,8 @@ def test_scheduler_rotates_retries_and_records_source_health(warehouse_config):
         "source_unavailable",
         "stale_symbol",
     }
-    assert {item["symbol"] for item in alerts if item["alert_type"] == "stale_symbol"} == {
-        "NVDA"
-    }
+    stale = next(item for item in alerts if item["alert_type"] == "stale_symbol")
+    assert stale["affected_symbols"] == ["NVDA"]
     assert enrichment_scheduler.acknowledge_enrichment_alert(
         alerts[0]["alert_id"], warehouse_config
     )
@@ -185,3 +184,159 @@ def test_operations_status_summarizes_scheduler_state(warehouse_config):
     assert status["active_schedule_count"] == 1
     assert status["source_health"] == []
     assert status["recent_runs"] == []
+
+
+@pytest.mark.unit
+def test_source_circuit_skips_redundant_calls_and_recovers_automatically(
+    warehouse_config,
+):
+    symbols = ["AAPL", "MSFT", "NVDA", "AMZN", "META"]
+    schedule = enrichment_scheduler.save_enrichment_schedule(
+        "Circuit protected",
+        symbols,
+        warehouse_config,
+        timezone="UTC",
+        weekdays=list(range(7)),
+        local_time="00:00",
+        max_symbols_per_run=5,
+        min_interval_seconds=0,
+        max_attempts=1,
+        stale_after_hours=720,
+    )
+    disabled_seen = []
+
+    def unavailable_collector(symbol, as_of_date, config):
+        disabled = config.get("enrichment_disabled_datasets", {})
+        disabled_seen.append((symbol, set(disabled)))
+        snapshot = _snapshot(symbol, as_of_date, macro_available=False)
+        if "macro_calendar" in disabled:
+            macro = next(
+                item for item in snapshot["sources"] if item["dataset"] == "macro_calendar"
+            )
+            macro["circuit_open"] = True
+            macro["retry_at"] = disabled["macro_calendar"]
+        return snapshot
+
+    first = enrichment_scheduler.execute_enrichment_schedule(
+        schedule,
+        "2026-10-23",
+        warehouse_config,
+        collector=unavailable_collector,
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert first["source_failure_count"] == 3
+    assert first["source_circuit_skip_count"] == 2
+    assert first["open_circuit_count"] == 1
+    assert first["next_retry_at"]
+    assert disabled_seen[:3] == [
+        ("AAPL", set()),
+        ("MSFT", set()),
+        ("NVDA", set()),
+    ]
+    assert all("macro_calendar" in disabled for _symbol, disabled in disabled_seen[3:])
+    alerts = enrichment_scheduler.list_enrichment_alerts(
+        warehouse_config, unacknowledged_only=True
+    )
+    source_alerts = [
+        item for item in alerts if item["alert_type"] == "source_unavailable"
+    ]
+    assert len(source_alerts) == 1
+    assert source_alerts[0]["affected_symbol_count"] == 5
+
+    connection = enrichment_scheduler._connect(warehouse_config)
+    connection.execute(
+        """UPDATE enrichment_source_circuits
+           SET retry_at = ?, state = 'open' WHERE dataset = 'macro_calendar'""",
+        [datetime.now(UTC)],
+    )
+    connection.close()
+    refreshed = enrichment_scheduler.get_enrichment_schedule(
+        schedule["schedule_id"], warehouse_config
+    )
+
+    def recovered_collector(symbol, as_of_date, config):
+        assert "macro_calendar" not in config.get("enrichment_disabled_datasets", {})
+        return _snapshot(symbol, as_of_date, macro_available=True)
+
+    second = enrichment_scheduler.execute_enrichment_schedule(
+        refreshed,
+        "2026-10-23",
+        warehouse_config,
+        collector=recovered_collector,
+        sleep_fn=lambda _seconds: None,
+    )
+    health = {
+        item["dataset"]: item
+        for item in enrichment_scheduler.list_enrichment_source_health(warehouse_config)
+    }
+    assert second["open_circuit_count"] == 0
+    assert second["next_retry_at"] is None
+    assert health["macro_calendar"]["circuit_state"] == "closed"
+    assert not any(
+        item["alert_type"] == "source_unavailable"
+        for item in enrichment_scheduler.list_enrichment_alerts(
+            warehouse_config, unacknowledged_only=True
+        )
+    )
+
+
+@pytest.mark.unit
+def test_open_circuit_retry_becomes_due_after_cooldown():
+    retry_at = datetime(2026, 10, 23, 18, 30, tzinfo=UTC)
+    schedule = {
+        "active": True,
+        "timezone": "UTC",
+        "weekdays": [4],
+        "local_time": "20:00",
+        "last_run_date": "2026-10-23",
+        "last_summary": {"next_retry_at": retry_at.isoformat()},
+    }
+
+    assert not enrichment_scheduler.enrichment_schedule_is_due(
+        schedule, retry_at - timedelta(seconds=1)
+    )
+    assert enrichment_scheduler.enrichment_schedule_is_due(
+        schedule, retry_at + timedelta(seconds=1)
+    )
+
+
+@pytest.mark.unit
+def test_legacy_symbol_alerts_are_grouped_and_acknowledged_together(warehouse_config):
+    schedule = enrichment_scheduler.save_enrichment_schedule(
+        "Grouped alerts", ["AAPL", "MSFT"], warehouse_config
+    )
+    connection = enrichment_scheduler._connect(warehouse_config)
+    for symbol in ("AAPL", "MSFT"):
+        enrichment_scheduler._create_alert(
+            connection,
+            schedule_id=schedule["schedule_id"],
+            run_id="run-1",
+            as_of_date="2026-10-23",
+            alert_type="source_unavailable",
+            severity="high",
+            title="Macro Calendar unavailable",
+            message=f"{symbol} returned no usable macro data.",
+            symbol=symbol,
+            dataset="macro_calendar",
+        )
+    connection.close()
+
+    alerts = enrichment_scheduler.list_enrichment_alerts(
+        warehouse_config, unacknowledged_only=True
+    )
+
+    assert len(alerts) == 1
+    assert sorted(alerts[0]["affected_symbols"]) == ["AAPL", "MSFT"]
+    assert alerts[0]["grouped_alert_count"] == 2
+    assert alerts[0]["symbol"] is None
+    assert "consolidated" in alerts[0]["message"]
+    assert enrichment_scheduler.acknowledge_enrichment_alert(
+        alerts[0]["alert_id"], warehouse_config
+    )
+    assert (
+        enrichment_scheduler.list_enrichment_alerts(
+            warehouse_config, unacknowledged_only=True
+        )
+        == []
+    )

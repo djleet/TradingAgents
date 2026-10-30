@@ -553,6 +553,9 @@ def _enrichment_operations_priorities(operations: dict[str, Any]) -> list[dict[s
                     "alert_type": alert.get("alert_type"),
                     "dataset": alert.get("dataset"),
                     "schedule_id": alert.get("schedule_id"),
+                    "affected_symbol_count": alert.get("affected_symbol_count", 0),
+                    "affected_symbols": alert.get("affected_symbols", []),
+                    "next_retry_at": alert.get("next_retry_at"),
                 },
             )
         )
@@ -954,6 +957,9 @@ def build_daily_briefing(
                 "unacknowledged_alert_count", 0
             ),
             "stale_symbol_count": enrichment_ops.get("stale_symbol_count", 0),
+            "affected_symbol_count": enrichment_ops.get("affected_symbol_count", 0),
+            "open_circuit_count": enrichment_ops.get("open_circuit_count", 0),
+            "next_retry_at": enrichment_ops.get("next_retry_at"),
         },
         "research_pack": {
             "available": latest_research_pack is not None,
