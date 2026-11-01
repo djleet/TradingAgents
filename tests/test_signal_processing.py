@@ -60,6 +60,20 @@ class TestParseRating:
         # `Rating：Overweight` (fullwidth colon) is read, not sent to review (#1170).
         assert parse_rating("Rating：Overweight\n理由はこちら。") == "Overweight"
 
+    def test_bold_standalone_rating_in_opening_preamble(self):
+        text = (
+            "# PORTFOLIO MANAGER SYNTHESIS\n\n"
+            "---\n\n"
+            "**Underweight**\n\n"
+            "---\n\n"
+            "## Executive Summary\n\nTrim exposure."
+        )
+        assert parse_rating(text) == "Underweight"
+
+    def test_bold_rating_after_prose_is_not_promoted_to_a_call(self):
+        text = "The committee remained divided.\n\n**Underweight**\n\nMore evidence."
+        assert parse_rating(text) == RATING_REVIEW
+
 
 @pytest.mark.unit
 class TestExtractRating:

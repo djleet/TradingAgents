@@ -52,6 +52,17 @@ _RATING_LINE_RE = re.compile(
 # A line presenting the scale rather than a decision ("Rating Scale: Buy, ...").
 _RATING_SCALE_RE = re.compile(r"rating\s*(scale|options|legend)", re.IGNORECASE)
 
+# Some provider fallbacks render the requested opening call as a bold standalone
+# line (``**Underweight**``) after a document title and horizontal rule, instead
+# of ``**Rating**: Underweight``. It is safe to accept only that opening-preamble
+# shape: a bold canonical value, before the first prose paragraph. Rating words
+# elsewhere remain ambiguous evidence and still resolve to REVIEW.
+_STANDALONE_OPENING_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*)?(?:\*\*|__)(Buy|Overweight|Hold|Underweight|Sell)(?:\*\*|__)\s*$",
+    re.IGNORECASE,
+)
+_MARKDOWN_RULE_RE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
+
 def extract_rating(text: str) -> str | None:
     """Extract a 5-tier rating from its label, or ``None`` if there is none.
 
@@ -63,6 +74,19 @@ def extract_rating(text: str) -> str | None:
     if not text:
         return None
     norm = unicodedata.normalize("NFKC", text)
+
+    # Read a standalone bold call only from the opening preamble. Titles and
+    # horizontal rules may precede it; any prose ends the safe preamble.
+    for line in norm.splitlines():
+        stripped = line.strip()
+        if not stripped or _MARKDOWN_RULE_RE.fullmatch(stripped):
+            continue
+        standalone = _STANDALONE_OPENING_RE.fullmatch(stripped)
+        if standalone:
+            return standalone.group(1).capitalize()
+        if stripped.startswith("#"):
+            continue
+        break
 
     # The decision is asked to open with its rating, so a first line (after any
     # headings) in that shape is the call. A list item there may also be a quote
